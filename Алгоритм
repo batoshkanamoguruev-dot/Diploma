@@ -1,0 +1,786 @@
+import pandas as pd
+import pandapower as pp
+
+from utils import plot_network_engineering
+
+
+def read_ieee_txt(path: str) -> pd.DataFrame:
+    # Файл: from to P(kW) Q(kvar) R(ohm) X(ohm) Imax(A)
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        names=["from", "to", "P_kW", "Q_kvar", "R_ohm", "X_ohm", "Imax_A"],
+        engine="python"
+    )
+    return df
+
+
+def build_ieee33_110_10(data_path="data/ieee33bus.txt") -> pp.pandapowerNet:
+    df = read_ieee_txt(data_path)
+
+    net = pp.create_empty_network(name="IEEE-33 adapted to 10 kV + 110/10 PS")
+
+    # 0 — шина 110 кВ, 1..33 — шины 10 кВ
+    bus_hv = pp.create_bus(net, vn_kv=110, name="HV 110 kV (ext grid)")
+    buses_mv = {}
+    for i in range(1, 34):
+        buses_mv[i] = pp.create_bus(net, vn_kv=10, name=f"Bus {i} (10 kV)")
+
+    # Источник на 110 кВ
+    pp.create_ext_grid(net, bus=bus_hv, vm_pu=1.02, name="External Grid 110 kV")
+
+    # Трансформатор 110/10 кВ на узел 1 (как “голова” фидера IEEE-33)
+    pp.create_transformer_from_parameters(
+        net,
+        hv_bus=bus_hv,
+        lv_bus=buses_mv[1],
+        sn_mva=10,
+        vn_hv_kv=110,
+        vn_lv_kv=10,
+        vk_percent=10.5,
+        vkr_percent=0.5,
+        pfe_kw=15,
+        i0_percent=0.1,
+        name="PS 110/10 kV"
+    )
+
+    # Линии + нагрузки (нагрузка сидит в узле 'to' — стандарт IEEE-33 в таком формате)
+    for _, row in df.iterrows():
+        fb = int(row["from"])
+        tb = int(row["to"])
+
+        pp.create_line_from_parameters(
+            net,
+            from_bus=buses_mv[fb],
+            to_bus=buses_mv[tb],
+            length_km=1.0,  # в исходнике сопротивления уже даны как "на участок"; оставляем 1 км как в твоих скриптах
+            r_ohm_per_km=float(row["R_ohm"]),
+            x_ohm_per_km=float(row["X_ohm"]),
+            c_nf_per_km=0.0,
+            max_i_ka=float(row["Imax_A"]) / 1000.0,  # A -> kA
+            name=f"Line {fb}-{tb}"
+        )
+
+        # pandapower ожидает MW/Mvar
+        p_mw = float(row["P_kW"]) / 1000.0
+        q_mvar = float(row["Q_kvar"]) / 1000.0
+
+        pp.create_load(
+            net,
+            bus=buses_mv[tb],
+            p_mw=p_mw,
+            q_mvar=q_mvar,
+            name=f"Load at bus {tb}"
+        )
+	 # ---- Tie-lines (НРТ) IEEE-33 ----
+    tie_lines = [
+        (8, 21),
+        (9, 15),
+        (12, 22),
+        (18, 33),
+        (25, 29)
+    ]
+
+    for fb, tb in tie_lines:
+        line_idx = pp.create_line_from_parameters(
+            net,
+            from_bus=buses_mv[fb],
+            to_bus=buses_mv[tb],
+            length_km=1.0,
+            r_ohm_per_km=0.4,
+            x_ohm_per_km=0.3,
+            c_nf_per_km=0.0,
+            max_i_ka=0.4,
+            name=f"TIE {fb}-{tb}"
+        )
+
+        pp.create_switch(
+            net,
+            bus=buses_mv[fb],
+            element=line_idx,
+            et="l",
+            closed=False,
+            type="CB",
+            name=f"NRP {fb}-{tb}"
+        )
+
+    return net
+
+def close_tie_switch(net, name):
+    idx = net.switch[net.switch.name == name].index[0]
+    net.switch.at[idx, "closed"] = True
+
+
+def open_line(net, from_bus, to_bus):
+    line_idx = net.line[
+        ((net.line.from_bus == from_bus) & (net.line.to_bus == to_bus)) |
+        ((net.line.from_bus == to_bus) & (net.line.to_bus == from_bus))
+    ].index[0]
+
+    pp.create_switch(
+        net,
+        bus=from_bus,
+        element=line_idx,
+        et="l",
+        closed=False,
+        type="CB",
+        name=f"OPEN {from_bus}-{to_bus}"
+    )
+
+
+import networkx as nx
+
+
+def is_radial(net):
+    G = nx.Graph()
+
+    for line_idx, line in net.line.iterrows():
+        sw = net.switch[
+            (net.switch.et == "l") &
+            (net.switch.element == line_idx)
+        ]
+        if len(sw) > 0 and not sw.closed.all():
+            continue  # линия разомкнута
+
+        G.add_edge(line.from_bus, line.to_bus)
+
+    return nx.is_tree(G)
+
+def evaluate_network(net):
+    try:
+        pp.runpp(net)
+    except:
+        return None
+
+    u_min = net.res_bus.vm_pu.min()
+    losses = net.res_line.pl_mw.sum() * 1000  # kW
+
+    return u_min, losses
+
+def reconfiguration_search(net, u_min_base, losses_base):
+
+    results = []
+
+    tie_switches = net.switch[
+        net.switch.name.str.contains("NRP")
+    ]["name"].tolist()
+
+    for tie_name in tie_switches:
+        print(f"\nTrying tie-switch: {tie_name}")
+
+        # 1. Замыкаем НРТ
+        close_tie_switch(net, tie_name)
+
+        # 2. Перебор линий
+        for line_idx, line in net.line.iterrows():
+
+            # пропускаем саму tie-линию
+            if f"{line.from_bus}-{line.to_bus}" in tie_name or \
+               f"{line.to_bus}-{line.from_bus}" in tie_name:
+                continue
+
+            # временно размыкаем линию
+            sw_name = f"TEMP_OPEN {line.from_bus}-{line.to_bus}"
+            pp.create_switch(
+                net,
+                bus=line.from_bus,
+                element=line_idx,
+                et="l",
+                closed=False,
+                type="CB",
+                name=sw_name
+            )
+
+            # 3. Проверка радиальности
+            if not is_radial(net):
+                net.switch.drop(
+                    net.switch[net.switch.name == sw_name].index,
+                    inplace=True
+                )
+                continue
+
+            # 4. ОЦЕНКА КОНФИГУРАЦИИ (КЛЮЧЕВОЕ МЕСТО)
+            metrics = evaluate_network(net)
+            if metrics is None:
+                net.switch.drop(
+                    net.switch[net.switch.name == sw_name].index,
+                    inplace=True
+                )
+                continue
+
+            u_min, losses = metrics
+
+            # ---------- ВОТ СЮДА ВСТАВЛЯЕТСЯ КОД ИЗ п.6.2 ----------
+
+            # эвристика 1
+            if u_min <= u_min_base and losses >= losses_base:
+                net.switch.drop(
+                    net.switch[net.switch.name == sw_name].index,
+                    inplace=True
+                )
+                continue
+
+            # эвристика 2
+            if u_min < 0.85:
+                net.switch.drop(
+                    net.switch[net.switch.name == sw_name].index,
+                    inplace=True
+                )
+                continue
+
+            # целевая функция
+            J = 0.6 * (1 - u_min) + 0.4 * (losses / losses_base)
+
+            results.append({
+                "tie": tie_name,
+                "open_line": f"{line.from_bus}-{line.to_bus}",
+                "u_min": u_min,
+                "losses": losses,
+                "J": J
+            })
+
+            # -----------------------------------------------------
+
+            # 5. Возвращаем линию
+            net.switch.drop(
+                net.switch[net.switch.name == sw_name].index,
+                inplace=True
+            )
+
+        # 6. Размыкаем НРТ обратно
+        idx = net.switch[net.switch.name == tie_name].index[0]
+        net.switch.at[idx, "closed"] = False
+
+    return pd.DataFrame(results)
+    
+# ================================
+# === НАДЁЖНОСТЬ (ENS / SAIDI) ===
+# ================================
+
+def apply_line_outage(net, line_idx): #Функция отказа линии 
+    sw_name = f"FAULT_{line_idx}"
+    pp.create_switch(
+        net,
+        bus=net.line.at[line_idx, "from_bus"],
+        element=line_idx,
+        et="l",
+        closed=False,
+        type="CB",
+        name=sw_name
+    )
+    return sw_name
+
+import networkx as nx
+
+def get_outaged_buses_graph(net, root_bus):
+    G = nx.Graph()
+
+    # 1. ЯВНО добавляем все шины
+    G.add_nodes_from(net.bus.index.tolist())
+
+    # 2. Добавляем только замкнутые линии
+    for line_idx, line in net.line.iterrows():
+        sw = net.switch[
+            (net.switch.et == "l") &
+            (net.switch.element == line_idx)
+        ]
+        if len(sw) > 0 and not sw.closed.all():
+            continue
+
+        G.add_edge(line.from_bus, line.to_bus)
+
+    # 3. Если корень изолирован — вся сеть обесточена
+    if root_bus not in G:
+        return list(net.bus.index)
+
+    connected = nx.node_connected_component(G, root_bus)
+
+    outaged = set(net.bus.index) - connected
+    return list(outaged)
+
+
+
+def get_outaged_load(net, outaged_buses):#нагрузка отключенной зоны
+    loads = net.load[net.load.bus.isin(outaged_buses)]
+    return loads.p_mw.sum()  # MW
+
+def get_outaged_customers(net, outaged_buses, bus_category, category_weight):
+    N = 0.0
+    for b in outaged_buses:
+        cat = bus_category.get(b, "III")
+        w = category_weight.get(cat, 1.0)
+        N += w
+    return N
+
+
+# ----------------------------
+# Коммутационные аппараты
+# ----------------------------
+
+
+
+def get_restore_time_by_sets(
+    line,
+    auto_set,
+    manual_set,
+    t_base,
+    t_manual,
+    t_auto
+):
+    fb = int(line.from_bus)
+    tb = int(line.to_bus)
+    key = tuple(sorted((fb, tb)))
+
+    if key in auto_set:
+        return t_auto
+    if key in manual_set:
+        return t_manual
+    return t_base
+
+# ======================================================
+# Экономические параметры
+# ======================================================
+HOURS_YEAR = 8760
+
+# Цена электроэнергии для оценки потерь (пример, поменяешь под себя)
+C_EN_MWH = 50.0   # €/MWh или руб/МWh — главное единицы
+
+# VoLL по категориям (пример, подставь свои значения)
+VOLL_BY_CAT = {
+    "I":   20000.0,   # €/MWh
+    "II":  10000.0,
+    "III":  3000.0
+}
+
+# CAPEX на КА
+CAPEX_AUTO = 15000.0   # €/шт
+CAPEX_MANUAL = 5000.0  # €/шт
+
+# Приведение CAPEX к годовым (аннуитет)
+DISCOUNT = 0.10  # 10% годовых
+LIFE_Y = 15      # лет
+
+# ======================================================
+# 
+# ======================================================
+
+
+def calculate_reliability(
+    net,
+    root_bus,
+    bus_category,
+    category_weight,
+    auto_set=None,
+    manual_set=None,
+    lambda_per_km=0.1,
+    t_base=3.0,
+    t_manual=1.0,
+    t_auto=0.1
+):
+    if auto_set is None:
+        auto_set = set()
+    if manual_set is None:
+        manual_set = set()
+
+
+    ENS = 0.0
+    SAIDI_num = 0.0
+    SAIFI_num = 0.0
+    ECOST = 0.0
+
+    N_total = len(net.bus)
+
+    for line_idx, line in net.line.iterrows():
+
+        # длина линии (км)
+        L = line.length_km
+        lambda_i = lambda_per_km * L
+
+        # авария линии
+        sw_fault = apply_line_outage(net, line_idx)
+
+        try:
+            pp.runpp(net)
+        except:
+            net.switch.drop(net.switch[net.switch.name == sw_fault].index, inplace=True)
+            continue
+
+        outaged_buses = get_outaged_buses_graph(net, root_bus)
+
+        if len(outaged_buses) > 0:
+            P_off = get_outaged_load(net, outaged_buses)  # MW
+            N_off = get_outaged_customers(
+                net,
+                outaged_buses,
+                bus_category,
+                category_weight
+            )
+
+            t_restore_i = get_restore_time_by_sets(
+                line,
+                auto_set,
+                manual_set,
+                t_base,
+                t_manual,
+                t_auto
+            )
+
+
+            cost_interrupt = 0.0
+            for b in outaged_buses:
+                cat = bus_category.get(b, "III")
+                voll = VOLL.get(cat, 8)
+                load_b = net.load[net.load.bus == b].p_mw.sum()
+                cost_interrupt += load_b * t_restore_i * voll
+
+            ECOST += lambda_i * cost_interrupt
+            SAIDI_num += lambda_i * N_off * t_restore_i
+            SAIFI_num += lambda_i * N_off
+
+
+        # восстановление линии
+        net.switch.drop(net.switch[net.switch.name == sw_fault].index, inplace=True)
+
+    SAIDI = SAIDI_num / N_total
+    SAIFI = SAIFI_num / N_total
+
+    return ENS, SAIDI, SAIFI, ECOST
+
+def line_contribution_analysis(
+    net,
+    root_bus,
+    bus_category,
+    category_weight,
+    lambda_per_km=0.1,
+    t_restore=1.0
+):
+    """
+    Расчёт вклада каждой линии в ENS / SAIDI / SAIFI
+    """
+    results = []
+
+    N_total = len(net.bus)
+
+    for line_idx, line in net.line.iterrows():
+
+        # не учитываем tie-линии
+        # пропускаем tie-линии (НРТ)
+        sw_tie = net.switch[
+            (net.switch.et == "l") &
+        (net.switch.element == line_idx) &
+        (net.switch.name.str.contains("NRP", na=False))
+        ]
+
+        if len(sw_tie) > 0:
+            continue
+
+
+        # интенсивность отказов линии
+        lambda_i = lambda_per_km * line.length_km
+
+        # моделируем отказ линии
+        sw_fault = apply_line_outage(net, line_idx)
+
+        try:
+            pp.runpp(net)
+        except:
+            net.switch.drop(net.switch[net.switch.name == sw_fault].index, inplace=True)
+            continue
+
+        # зона отключения
+        outaged_buses = get_outaged_buses_graph(net, root_bus)
+
+        if len(outaged_buses) > 0:
+            P_off = get_outaged_load(net, outaged_buses)      # MW
+            N_off = get_outaged_customers(
+                net,
+                outaged_buses,
+                bus_category,
+                category_weight
+            )# потребители
+
+            ENS_i = lambda_i * P_off * t_restore
+            SAIDI_i = lambda_i * N_off * t_restore / N_total
+            SAIFI_i = lambda_i * N_off / N_total
+        else:
+            ENS_i = 0.0
+            SAIDI_i = 0.0
+            SAIFI_i = 0.0
+
+        results.append({
+            "line": f"{line.from_bus}-{line.to_bus}",
+            "ENS": ENS_i,
+            "SAIDI": SAIDI_i,
+            "SAIFI": SAIFI_i,
+            "P_off_MW": P_off if len(outaged_buses) > 0 else 0.0,
+            "N_off": N_off if len(outaged_buses) > 0 else 0
+        })
+
+        # восстанавливаем линию
+        net.switch.drop(net.switch[net.switch.name == sw_fault].index, inplace=True)
+
+    return pd.DataFrame(results)
+
+def greedy_auto_ka_placement(
+    net,
+    root_bus,
+    bus_category,
+    category_weight,
+    candidate_lines,
+    max_auto_ka=3
+):
+    auto_set = set()
+
+    ENS_base, SAIDI_base, SAIFI_base = calculate_reliability(
+        net,
+        root_bus,
+        bus_category,
+        category_weight
+    )
+
+    for _, row in candidate_lines.iterrows():
+        if len(auto_set) >= max_auto_ka:
+            break
+
+        line_name = row["line"]
+        fb, tb = map(int, line_name.split("-"))
+        line_key = (fb, tb)
+
+        # пробуем поставить автомат
+        auto_set.add(line_key)
+
+        ENS_new, SAIDI_new, SAIFI_new = calculate_reliability(
+            net,
+            root_bus,
+            bus_category,
+            category_weight,
+            auto_set=auto_set
+        )
+
+        # критерий полезности
+        if SAIDI_new < SAIDI_base:
+            SAIDI_base = SAIDI_new
+            ENS_base = ENS_new
+        else:
+            auto_set.remove(line_key)
+
+    return auto_set
+
+
+if __name__ == "__main__":
+
+    # ======================================================
+    # 0. ИНИЦИАЛИЗАЦИЯ
+    # ======================================================
+    print("\n=== INITIALIZATION ===")
+
+    net = build_ieee33_110_10()
+    pp.runpp(net)
+
+    root_bus = net.bus[net.bus.name == "Bus 1 (10 kV)"].index[0]
+
+
+    bus_cat_df = pd.read_csv(
+        "data/bus_categories.csv",
+        sep=None,
+        engine="python",
+        encoding="utf-8-sig"
+    )
+
+    print("RAW COLUMNS:", bus_cat_df.columns.tolist())
+    print(bus_cat_df.head())
+
+    # ======================================================
+    # 0.1 КАТЕГОРИИ ПОТРЕБИТЕЛЕЙ
+    # ======================================================
+    bus_cat_df = pd.read_csv("data/bus_categories.csv", sep=",")
+
+    # первая строка — мусор, выбрасываем
+    bus_cat_df = pd.read_csv(
+        "data/bus_categories.csv",
+        sep=",",
+        skiprows=2,      # <- КЛЮЧЕВОЕ: убираем sep=, и заголовки
+        header=None,
+        names=["bus", "category", "weight"],
+        encoding="utf-8-sig"
+    )
+
+    print("COLUMNS AFTER FIX:", bus_cat_df.columns.tolist())
+    print(bus_cat_df.head())
+
+    bus_cat_df["bus"] = bus_cat_df["bus"].astype(int)
+    bus_cat_df["weight"] = bus_cat_df["weight"].astype(float)
+
+    BUS_CATEGORY = dict(zip(bus_cat_df["bus"], bus_cat_df["category"]))
+    CATEGORY_WEIGHT = dict(zip(bus_cat_df["category"], bus_cat_df["weight"]))
+
+    # ------------------------------------------------------
+    # ИНИЦИАЛИЗАЦИЯ КОММУТАЦИОННЫХ АППАРАТОВ
+    # ------------------------------------------------------
+    auto_set = set()     # автоматические КА
+    manual_set = set()   # ручные КА
+
+    # ======================================================
+    # 1. БАЗОВАЯ НАДЁЖНОСТЬ
+    # ======================================================
+    print("\n=== BASE RELIABILITY ===")
+
+    ENS_base, SAIDI_base, SAIFI_base = calculate_reliability(
+        net,
+        root_bus,
+        bus_category=BUS_CATEGORY,
+        category_weight=CATEGORY_WEIGHT,
+        auto_set=auto_set,
+        manual_set=manual_set
+    )
+
+    print(f"ENS   = {ENS_base:.3f} MWh/year")
+    print(f"SAIDI = {SAIDI_base:.3f} h/year")
+    print(f"SAIFI = {SAIFI_base:.3f} 1/year")
+
+    u_min_base = net.res_bus.vm_pu.min()
+    losses_base = net.res_line.pl_mw.sum() * 1000
+
+    print("\n=== BASE CONFIGURATION ===")
+    print(f"Min voltage = {u_min_base:.4f} pu")
+    print(f"Losses      = {losses_base:.2f} kW")
+
+    # ======================================================
+    # 2. ВКЛАД ЛИНИЙ (БАЗОВАЯ СХЕМА)
+    # ======================================================
+    print("\n=== LINE CONTRIBUTION ANALYSIS (BASE) ===")
+
+    df_contrib_base = line_contribution_analysis(
+        net,
+        root_bus,
+        BUS_CATEGORY,
+        CATEGORY_WEIGHT
+    )
+
+    print("\nTOP-10 LINES BY SAIDI:")
+    print(df_contrib_base.sort_values("SAIDI", ascending=False).head(10))
+
+    # ======================================================
+    # 3. АВТОМАТИЧЕСКИЕ КА (БАЗА)
+    # ======================================================
+    auto_set_base = greedy_auto_ka_placement(
+        net,
+        root_bus,
+        BUS_CATEGORY,
+        CATEGORY_WEIGHT,
+        candidate_lines=df_contrib_base.sort_values("SAIDI", ascending=False).head(10),
+        max_auto_ka=4
+    )
+
+    ENS_base_ka, SAIDI_base_ka, SAIFI_base_ka = calculate_reliability(
+        net,
+        root_bus,
+        bus_category=BUS_CATEGORY,
+        category_weight=CATEGORY_WEIGHT,
+        auto_set=auto_set_base,
+        manual_set=set()
+    )
+
+    print("\n=== BASE + AUTOMATIC KAs ===")
+    print("Automatic KAs:", auto_set_base)
+    print(f"ENS   = {ENS_base_ka:.3f} MWh/year")
+    print(f"SAIDI = {SAIDI_base_ka:.3f} h/year")
+    print(f"SAIFI = {SAIFI_base_ka:.3f} 1/year")
+
+    # ======================================================
+    # 4. РЕКОНФИГУРАЦИЯ
+    # ======================================================
+    print("\n=== RECONFIGURATION SEARCH ===")
+
+    df_reconf = reconfiguration_search(
+        net,
+        u_min_base=u_min_base,
+        losses_base=losses_base
+    )
+
+    best = df_reconf.sort_values("J").iloc[0]
+
+    print("\n=== OPTIMAL RECONFIGURATION SELECTED ===")
+    print(best)
+
+    print("\n>>> APPLYING OPTIMAL RECONFIGURATION <<<")
+
+    close_tie_switch(net, best["tie"])
+    fb, tb = map(int, best["open_line"].split("-"))
+    open_line(net, fb, tb)
+
+    pp.runpp(net)
+
+    # ======================================================
+    # 5. НАДЁЖНОСТЬ ПОСЛЕ РЕКОНФИГУРАЦИИ
+    # ======================================================
+    ENS_rec, SAIDI_rec, SAIFI_rec = calculate_reliability(
+        net,
+        root_bus,
+        bus_category=BUS_CATEGORY,
+        category_weight=CATEGORY_WEIGHT,
+        auto_set=set(),
+        manual_set=set()
+    )
+
+    print("\n=== RELIABILITY AFTER RECONFIGURATION ===")
+    print(f"ENS   = {ENS_rec:.3f} MWh/year")
+    print(f"SAIDI = {SAIDI_rec:.3f} h/year")
+    print(f"SAIFI = {SAIFI_rec:.3f} 1/year")
+
+    # ======================================================
+    # 6. ВКЛАД ЛИНИЙ ПОСЛЕ РЕКОНФИГУРАЦИИ
+    # ======================================================
+    print("\n=== LINE CONTRIBUTION ANALYSIS (AFTER RECONFIGURATION) ===")
+
+    df_contrib_rec = line_contribution_analysis(
+        net,
+        root_bus,
+        BUS_CATEGORY,
+        CATEGORY_WEIGHT,
+    )
+
+    print("\nTOP-10 LINES BY SAIDI:")
+    print(df_contrib_rec.sort_values("SAIDI", ascending=False).head(10))
+
+    # ======================================================
+    # 7. АВТОМАТИЧЕСКИЕ КА ПОСЛЕ РЕКОНФИГУРАЦИИ
+    # ======================================================
+    auto_set_rec = greedy_auto_ka_placement(
+        net,
+        root_bus,
+        BUS_CATEGORY,
+        CATEGORY_WEIGHT,
+        candidate_lines=df_contrib_rec.sort_values("SAIDI", ascending=False).head(10),
+        max_auto_ka=4
+    )
+
+    ENS_rec_ka, SAIDI_rec_ka, SAIFI_rec_ka = calculate_reliability(
+        net,
+        root_bus,
+        bus_category=BUS_CATEGORY,
+        category_weight=CATEGORY_WEIGHT,
+        auto_set=auto_set_rec,
+        manual_set=set()
+    )
+
+    print("\n=== RECONFIGURATION + AUTOMATIC KAs ===")
+    print("Automatic KAs:", auto_set_rec)
+    print(f"ENS   = {ENS_rec_ka:.3f} MWh/year")
+    print(f"SAIDI = {SAIDI_rec_ka:.3f} h/year")
+    print(f"SAIFI = {SAIFI_rec_ka:.3f} 1/year")
+    
+
+    # ======================================================
+    # 8. ВИЗУАЛИЗАЦИЯ
+    # ======================================================
+    plot_network_engineering(
+        net,
+        root_bus=root_bus,
+        title=f"IEEE-33 – Reconfiguration ({best['tie']} / open {best['open_line']}) + KAs"
+    )
+
+
+
+
